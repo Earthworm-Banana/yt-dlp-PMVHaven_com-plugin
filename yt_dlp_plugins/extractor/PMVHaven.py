@@ -29,6 +29,7 @@ class PMVHavenVideoIE(InfoExtractor):
         return {
             'id': video_id,
             'title': title,
+            'age_limit': 18,
             'uploader': uploader,
             'categories': categories,
             'tags': tags,
@@ -125,11 +126,10 @@ class PMVHavenVideoIE(InfoExtractor):
         if video_url:
             return [{
                 'url': video_url, 
-                'format_id': 'mp4', 
                 'ext': 'mp4', 
                 'http_headers': {'Referer': f'{url}'},
-                'vcodec': 'unknown',
-                'acodec': 'unknown',
+                #'vcodec': '',
+                #'acodec': '',
                 'resolution': resolution
             }]
         return []
