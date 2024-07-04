@@ -54,9 +54,7 @@ class PMVHavenVideoIE(InfoExtractor):
         return None
 
     def _extract_uploader(self, soup):
-        uploader_meta = soup.find('meta', attrs={'name': 'author'})
-        if uploader_meta:
-            return uploader_meta['content']
+        # Implement your method to extract categories here
         return None
 
     def _extract_categories(self, soup):
