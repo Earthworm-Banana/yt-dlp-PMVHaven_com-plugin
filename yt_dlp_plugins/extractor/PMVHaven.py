@@ -141,19 +141,35 @@ class PMVHavenVideoIE(InfoExtractor):
 
     def _extract_formats(self, soup, url):
 
+        # collect .mp4 URLs (video.pmvhaven.com and storage.pmvhaven.com)
+        # score candidates 1. video.pmvhaven.com, 2. if first path segment looks like this page's video id, 3. bonus if slug/title words appear in the URL, 4. penalize /videoPreview/ or /previews/
+        # pick highest-scoring
+        
+        import urllib.parse
+
         webpage = str(soup)
-        video_meta = soup.find('meta', attrs={'property': 'og:video:secure_url'})
-        if not video_meta:
-            video_meta = soup.find('meta', attrs={'name': 'twitter:player'})
-        video_url = video_meta['content'] if video_meta else None
+
+        title = self._extract_title(soup) or ''
+        title_norm = re.sub(r'\s+', ' ', title).strip().lower()
+
+        page_vid = self._search_regex(
+            r'_([0-9a-fA-F]{24})', url, 'video id', default=None)
+
+        slug = None
+        m_slug = re.search(r'/video/([^_?]+)_[0-9a-fA-F]{24}', url)
+        if m_slug:
+            slug = urllib.parse.unquote(m_slug.group(1))
+        slug_words = [w.lower() for w in re.split(r'[-_\s]+', slug or '') if len(w) > 2]
 
         width = self._extract_width(soup)
         height = self._extract_height(soup)
         resolution = f'{width}x{height}' if width and height else None
 
-        formats = []
+        def is_preview(u: str) -> bool:
+            u = u.lower()
+            return '/videopreview/' in u or '/previews/' in u
 
-        def _normalize_url(vurl: str) -> str:
+        def normalize_url(vurl: str) -> str:
             if not vurl:
                 return vurl
             vurl = vurl.strip()
@@ -165,59 +181,92 @@ class PMVHavenVideoIE(InfoExtractor):
                 (parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment)
             )
 
-        def _add_format(vurl: str):
-            vurl = _normalize_url(vurl)
+        candidates = []
+
+        def add_candidate(vurl: str, base_score: int = 0, source: str = ''):
+            vurl = normalize_url(vurl)
             if not vurl:
                 return
-            fmt = {
+
+            parsed = urllib.parse.urlsplit(vurl)
+            path_parts = parsed.path.strip('/').split('/')
+            first_seg = path_parts[0] if path_parts else ''
+            id_in_url = first_seg if re.match(r'^[0-9a-fA-F]{24}$', first_seg) else None
+
+            url_l = vurl.lower()
+            score = base_score
+
+            if is_preview(url_l):
+                score -= 20
+
+            if parsed.netloc.startswith('video.pmvhaven.com'):
+                score += 10
+            elif parsed.netloc.startswith('storage.pmvhaven.com'):
+                score += 0
+
+            if page_vid and id_in_url and id_in_url.lower() == page_vid.lower():
+                score += 10
+
+            for w in slug_words:
+                if w and w in url_l:
+                    score += 2
+
+            for w in re.split(r'\s+', title_norm):
+                if len(w) > 3 and w in url_l:
+                    score += 1
+
+            candidates.append({
                 'url': vurl,
-                'ext': 'mp4',
-                'http_headers': {'Referer': url},
-            }
-            if resolution:
-                fmt['resolution'] = resolution
-            m = re.search(r'(\d{3,4})p', vurl)
-            if m:
-                h = int_or_none(m.group(1))
-                if h:
-                    fmt['height'] = h
-            formats.append(fmt)
+                'score': score,
+                'is_preview': is_preview(url_l),
+                'source': source,
+            })
 
-        if video_url:
-            _add_format(video_url)
+        mp4_patterns = [
+            r'(?:https?:\/\/)?video\.pmvhaven\.com\/[^"\'<>]+?\.mp4',
+            r'(?:https?:\/\/)?storage\.pmvhaven\.com\/[^"\'<>]+?\.mp4',
+        ]
+        for pattern in mp4_patterns:
+            for u in re.findall(pattern, webpage):
+                add_candidate(u, base_score=0, source='scan')
 
-        if webpage:
-            mp4_patterns = [
-                # Old backend
-                r'(?:https?:\/\/)?storage\.pmvhaven\.com\/[^"\'<>]+?\.mp4',
-                # New backend
-                r'(?:https?:\/\/)?video\.pmvhaven\.com\/videos\/[^"\'<>]+?\.mp4',
-            ]
+        video_meta = soup.find('meta', attrs={'property': 'og:video:secure_url'})
+        if not video_meta:
+            video_meta = soup.find('meta', attrs={'name': 'twitter:player'})
+        if video_meta and video_meta.get('content'):
+            add_candidate(video_meta['content'], base_score=-5, source='meta')
 
-            mp4_urls = []
-            for pattern in mp4_patterns:
-                mp4_urls.extend(re.findall(pattern, webpage))
+        if not candidates:
+            return []
 
-            if mp4_urls:
-                normalized = [_normalize_url(u) for u in mp4_urls]
+        unique = {}
+        for c in candidates:
+            u = c['url']
+            if u not in unique or c['score'] > unique[u]['score']:
+                unique[u] = c
 
-                originals = [
-                    u for u in normalized
-                    if '/videoPreview/' not in u and '/previews/' not in u
-                ] or normalized
+        all_cands = list(unique.values())
 
-                for vurl in originals:
-                    _add_format(vurl)
+        non_preview = [c for c in all_cands if not c['is_preview']]
+        chosen_pool = non_preview or all_cands
 
-        unique = []
-        seen = set()
-        for f in formats:
-            if f['url'] in seen:
-                continue
-            seen.add(f['url'])
-            unique.append(f)
+        best = max(chosen_pool, key=lambda c: (c['score'], len(c['url'])))
 
-        return unique
+        fmt = {
+            'url': best['url'],
+            'ext': 'mp4',
+            'http_headers': {'Referer': url},
+        }
+        if resolution:
+            fmt['resolution'] = resolution
+
+        m_h = re.search(r'(\d{3,4})p', best['url'])
+        if m_h:
+            h = int_or_none(m_h.group(1))
+            if h:
+                fmt['height'] = h
+
+        return [fmt]
 
     def _extract_video_meta(self, soup):
         meta = {}
