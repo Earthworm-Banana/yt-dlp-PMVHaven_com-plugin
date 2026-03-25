@@ -222,12 +222,14 @@ class PMVHavenVideoIE(InfoExtractor):
                 'source': source,
             })
 
+        _SEP = r'(?:/|\\u002F)'
         mp4_patterns = [
-            r'(?:https?:\/\/)?video\.pmvhaven\.com\/[^"\'<>]+?\.mp4',
-            r'(?:https?:\/\/)?storage\.pmvhaven\.com\/[^"\'<>]+?\.mp4',
+            rf'https?:{_SEP}{_SEP}video\.pmvhaven\.com{_SEP}[^"\'<>\s]+?\.mp4',
+            rf'https?:{_SEP}{_SEP}storage\.pmvhaven\.com{_SEP}[^"\'<>\s]+?\.mp4',
         ]
         for pattern in mp4_patterns:
             for u in re.findall(pattern, webpage):
+                u = u.replace('\\u002F', '/')  # decode JSON unicode escapes
                 add_candidate(u, base_score=0, source='scan')
 
         video_meta = soup.find('meta', attrs={'property': 'og:video:secure_url'})
