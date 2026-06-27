@@ -16,26 +16,41 @@ import urllib.parse
 class PMVHavenVideoIE(InfoExtractor):
     IE_NAME = 'pmvhaven:video'
     _VALID_URL = r'https?://(?:www\.)?pmvhaven\.com/video/[^_]+_(?P<id>[a-zA-Z0-9]+)'
-    
+
     def _real_extract(self, url):
         video_id = self._match_id(url)
         webpage = self._download_webpage(url, video_id)
         soup = BeautifulSoup(webpage, 'html.parser')
 
-        title = self._extract_title(soup)
-        uploader = self._extract_uploader(soup)
-        categories = self._extract_categories(soup)
-        tags = self._extract_tags(soup)
-        music = self._extract_music(soup)
+        # Fetch the API endpoint
+        api_res = self._download_json(
+            f'https://pmvhaven.com/api/videos/{video_id}',
+            video_id,
+            fatal=False
+        ) or {}
+        api_data = api_res.get('data') or {}
+
+        # Fetch the JSON-LD
+        json_ld = self._extract_json_ld_video_object(soup)
+
+        title = self._extract_title(soup, api_data, json_ld)
+        uploader = self._extract_uploader(soup, api_data, json_ld)
+        categories = self._extract_categories(soup, api_data, json_ld)
+        tags = self._extract_tags(soup, api_data, json_ld)
+        music = self._extract_music(soup, api_data)
         creator = self._extract_creator(soup)
-        stars = self._extract_stars(soup)
-        description = self._extract_description(soup)
-        duration = self._extract_duration(soup)
-        view_count = self._extract_view_count(soup)
-        upload_date = self._extract_upload_date(soup)
-        thumbnail = self._extract_thumbnail(soup)
-        formats = self._extract_formats(soup, url)
-        video_meta = self._extract_video_meta(soup)
+        stars = self._extract_stars(soup, api_data)
+        description = self._extract_description(soup, api_data, json_ld)
+        duration = self._extract_duration(soup, api_data, json_ld)
+        view_count = self._extract_view_count(soup, api_data, json_ld)
+        like_count = api_data.get('likes')
+        dislike_count = api_data.get('dislikes')
+        average_rating = api_data.get('rating')
+        upload_date = self._extract_upload_date(soup, api_data, json_ld)
+        thumbnails = self._extract_thumbnails(soup, api_data, json_ld)
+        formats = self._extract_formats(soup, url, json_ld, api_data)
+        video_meta = self._extract_video_meta(soup, api_data)
+        fun_scripts = self._extract_funscripts(api_data)
 
         return {
             'id': video_id,
@@ -50,40 +65,120 @@ class PMVHavenVideoIE(InfoExtractor):
             'description': description,
             'duration': duration,
             'view_count': view_count,
+            'like_count': like_count,
+            'dislike_count': dislike_count,
+            'average_rating': average_rating,
             'upload_date': upload_date,
-            'thumbnail': thumbnail,
+            'thumbnails': thumbnails,
             'formats': formats,
+            'user_fun_scripts': fun_scripts,
             **video_meta
         }
 
-    def _extract_title(self, soup):
+    def _extract_json_ld_video_object(self, soup):
+        """
+        Traverses all application/ld+json scripts on the page to find
+        and aggregate fields from a 'VideoObject' structure.
+        """
+        video_data = {}
+        for script in soup.find_all('script', type='application/ld+json'):
+            if not script.string:
+                continue
+            try:
+                data = json.loads(script.string)
+
+                def walk(obj):
+                    if isinstance(obj, dict):
+                        if obj.get('@type') == 'VideoObject':
+                            for k, v in obj.items():
+                                if v and k not in video_data:
+                                    video_data[k] = v
+                        for v in obj.values():
+                            walk(v)
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            walk(item)
+
+                walk(data)
+            except Exception:
+                pass
+        return video_data
+
+    def _extract_title(self, soup, api_data, json_ld):
+        if api_data.get('title'):
+            return api_data['title'].strip()
+
+        if json_ld.get('name'):
+            return json_ld['name'].strip()
+
         title_meta = soup.find('meta', attrs={'property': 'og:title'})
-        if title_meta:
-            return title_meta['content']
-        title_meta = soup.find('meta', attrs={'name': 'twitter:title'})
-        if title_meta:
-            return title_meta['content']
+        if not title_meta:
+            title_meta = soup.find('meta', attrs={'name': 'og:title'})
+        if not title_meta:
+            title_meta = soup.find('meta', attrs={'name': 'twitter:title'})
+
+        if title_meta and title_meta.get('content'):
+            raw_title = title_meta['content']
+        else:
+            title_tag = soup.find('title')
+            raw_title = title_tag.string if title_tag else None
+
+        if not raw_title:
+            h1_tag = soup.find('h1')
+            raw_title = h1_tag.get_text() if h1_tag else None
+
+        if raw_title:
+            clean_title = raw_title.strip()
+            clean_title = re.sub(r'\s*-\s*PMVHaven\s*$', '', clean_title, flags=re.IGNORECASE)
+            return clean_title
+
         return None
 
-    def _extract_uploader(self, soup):
-        # Implement your method to extract categories here
+    def _extract_uploader(self, soup, api_data, json_ld):
+        if api_data.get('uploader'):
+            return api_data['uploader']
+        if api_data.get('uploaderUsername'):
+            return api_data['uploaderUsername']
+
+        creator = json_ld.get('author') or json_ld.get('creator')
+        if isinstance(creator, dict) and creator.get('name'):
+            return creator['name']
         return None
 
-    def _extract_categories(self, soup):
-        # Implement your method to extract categories here
+    def _extract_categories(self, soup, api_data, json_ld):
         return []
 
-    def _extract_tags(self, soup):
+    def _extract_tags(self, soup, api_data, json_ld):
+        # 1. API Endpoint
+        if api_data.get('tags') and isinstance(api_data['tags'], list):
+            return [t.strip() for t in api_data['tags'] if t.strip()]
+
+        # 2. JSON-LD Keyword string
+        if json_ld.get('keywords'):
+            return [k.strip() for k in json_ld['keywords'].split(',') if k.strip()]
+
+        # 3. DOM Meta tags fallback
         tags_meta = soup.find('meta', attrs={'property': 'og:video:tag'})
         if tags_meta:
-            return tags_meta['content'].split(', ')
+            return [t.strip() for t in tags_meta['content'].split(',') if t.strip()]
         keywords_meta = soup.find('meta', attrs={'name': 'keywords'})
         if keywords_meta:
-            return keywords_meta['content'].split(', ')
+            return [t.strip() for t in keywords_meta['content'].split(',') if t.strip()]
+
         return []
 
-    def _extract_music(self, soup):
-        # Implement your method to extract music here
+    def _extract_music(self, soup, api_data):
+        music_list = api_data.get('music')
+        # Return exact dictionary format
+        if isinstance(music_list, list):
+            return music_list
+        return []
+
+    def _extract_funscripts(self, api_data):
+        fun_scripts = api_data.get('userFunScripts')
+        # Return exact dictionary format
+        if isinstance(fun_scripts, list):
+            return fun_scripts
         return []
 
     def _extract_creator(self, soup):
@@ -103,53 +198,124 @@ class PMVHavenVideoIE(InfoExtractor):
 
         return None
 
-    def _extract_stars(self, soup):
-        # Implement your method to extract stars here
-        return []
+    def _extract_stars(self, soup, api_data):
+        stars = set()
+        if api_data.get('stars') and isinstance(api_data['stars'], list):
+            for s in api_data['stars']:
+                if s.strip():
+                    stars.add(s.strip())
+        if api_data.get('starsTags') and isinstance(api_data['starsTags'], list):
+            for s in api_data['starsTags']:
+                if s.strip():
+                    stars.add(s.strip())
+        return list(stars) if stars else []
 
-    def _extract_description(self, soup):
-        desc_meta = soup.find('meta', attrs={'name': 'description'})
-        if desc_meta:
-            return desc_meta['content']
-        desc_meta = soup.find('meta', attrs={'property': 'og:description'})
-        if desc_meta:
-            return desc_meta['content']
+    def _extract_description(self, soup, api_data, json_ld):
+        if api_data.get('description'):
+            return api_data['description']
+
+        #if json_ld.get('description'):
+        #    return json_ld['description']
+
+        #desc_meta = soup.find('meta', attrs={'name': 'description'})
+        #if desc_meta:
+        #    return desc_meta['content']
+        #desc_meta = soup.find('meta', attrs={'property': 'og:description'})
+        #if desc_meta:
+        #    return desc_meta['content']
         return None
 
-    def _extract_duration(self, soup):
+    def _extract_duration(self, soup, api_data, json_ld):
+        # API provides specific duration in seconds directly
+        if api_data.get('durationSeconds') is not None:
+            try:
+                return int(api_data['durationSeconds'])
+            except ValueError:
+                pass
+
+        if api_data.get('duration'):
+            try:
+                # Sometimes duration is returned as '1:30', fallback logic if 'durationSeconds' misses
+                duration_str = str(api_data['duration'])
+                if ':' in duration_str:
+                    parts = duration_str.split(':')
+                    return sum(int(x) * 60 ** i for i, x in enumerate(reversed(parts)))
+                return int(duration_str)
+            except ValueError:
+                pass
+
         duration_meta = soup.find('meta', attrs={'property': 'og:video:duration'})
-        if duration_meta:
-            return int(duration_meta['content'])
+        if duration_meta and duration_meta.get('content'):
+            try:
+                return int(duration_meta['content'])
+            except ValueError:
+                pass
         return None
 
-    def _extract_view_count(self, soup):
-        # Implement your method to extract view count here
+    def _extract_view_count(self, soup, api_data, json_ld):
+        if api_data.get('views'):
+            try:
+                return int(api_data['views'])
+            except ValueError:
+                pass
+
+        interactions = json_ld.get('interactionStatistic')
+        if isinstance(interactions, list):
+            for interaction in interactions:
+                i_type = interaction.get('interactionType')
+                if isinstance(i_type, dict) and i_type.get('@type') == 'WatchAction':
+                    return interaction.get('userInteractionCount')
+                elif isinstance(i_type, str) and 'WatchAction' in i_type:
+                    return interaction.get('userInteractionCount')
         return None
 
-    def _extract_upload_date(self, soup):
-        # Implement your method to extract upload date here
+    def _extract_upload_date(self, soup, api_data, json_ld):
+        # Check API first (releaseDate is most accurate), then fallback to JSON-LD
+        date_str = api_data.get('releaseDate') or api_data.get('createdAt') or json_ld.get('uploadDate')
+
+        if date_str:
+            # Converts format "2024-01-01T00:00:00.000Z" to yt-dlp standard "20240101"
+            m = re.match(r'^(\d{4})-?(\d{2})-?(\d{2})', date_str)
+            if m:
+                return f"{m.group(1)}{m.group(2)}{m.group(3)}"
         return None
 
-    def _extract_thumbnail(self, soup):
-        thumbnail_meta = soup.find('meta', attrs={'property': 'og:image'})
-        if thumbnail_meta:
-            return thumbnail_meta['content']
-        thumbnail_meta = soup.find('meta', attrs={'name': 'twitter:image'})
-        if thumbnail_meta:
-            return thumbnail_meta['content']
-        return None
+    def _extract_thumbnails(self, soup, api_data, json_ld):
+        thumbnails = []
+        sizes = api_data.get('thumbnailSizes')
 
-    def _extract_formats(self, soup, url):
+        # Prioritize exact multi-resolution API sizes
+        if isinstance(sizes, dict):
+            for size_key, size_data in sizes.items():
+                if isinstance(size_data, dict) and size_data.get('url'):
+                    thumbnails.append({
+                        'id': size_key,
+                        'url': size_data['url'],
+                        'width': size_data.get('width'),
+                        'height': size_data.get('height'),
+                        'filesize': size_data.get('size'),
+                    })
 
-        # collect .mp4 URLs (video.pmvhaven.com and storage.pmvhaven.com)
-        # score candidates 1. video.pmvhaven.com, 2. if first path segment looks like this page's video id, 3. bonus if slug/title words appear in the URL, 4. penalize /videoPreview/ or /previews/
-        # pick highest-scoring
-        
-        import urllib.parse
+        # If individual sizes were missing or empty, fallback to basic options
+        if not thumbnails:
+            if api_data.get('thumbnailUrl'):
+                thumbnails.append({'url': api_data['thumbnailUrl']})
+            elif json_ld.get('thumbnailUrl'):
+                thumbnails.append({'url': json_ld['thumbnailUrl']})
+            else:
+                thumbnail_meta = soup.find('meta', attrs={'property': 'og:image'})
+                if not thumbnail_meta:
+                    thumbnail_meta = soup.find('meta', attrs={'name': 'twitter:image'})
+                if thumbnail_meta:
+                    thumbnails.append({'url': thumbnail_meta['content']})
 
+        return thumbnails
+
+    def _extract_formats(self, soup, url, json_ld, api_data):
         webpage = str(soup)
 
-        title = self._extract_title(soup) or ''
+        title_meta = soup.find('title')
+        title = title_meta.string if title_meta else ''
         title_norm = re.sub(r'\s+', ' ', title).strip().lower()
 
         page_vid = self._search_regex(
@@ -161,8 +327,8 @@ class PMVHavenVideoIE(InfoExtractor):
             slug = urllib.parse.unquote(m_slug.group(1))
         slug_words = [w.lower() for w in re.split(r'[-_\s]+', slug or '') if len(w) > 2]
 
-        width = self._extract_width(soup)
-        height = self._extract_height(soup)
+        width = self._extract_width(soup, api_data)
+        height = self._extract_height(soup, api_data)
         resolution = f'{width}x{height}' if width and height else None
 
         def is_preview(u: str) -> bool:
@@ -223,6 +389,13 @@ class PMVHavenVideoIE(InfoExtractor):
             })
 
         _SEP = r'(?:/|\\u002F)'
+
+        # 1. Gather standalone progressive MP4 links
+        if api_data.get('videoUrl'):
+            add_candidate(api_data['videoUrl'], base_score=50, source='api')
+        if api_data.get('previewUrl'):
+            add_candidate(api_data['previewUrl'], base_score=-20, source='api')
+
         mp4_patterns = [
             rf'https?:{_SEP}{_SEP}video\.pmvhaven\.com{_SEP}[^"\'<>\s]+?\.mp4',
             rf'https?:{_SEP}{_SEP}storage\.pmvhaven\.com{_SEP}[^"\'<>\s]+?\.mp4',
@@ -238,57 +411,110 @@ class PMVHavenVideoIE(InfoExtractor):
         if video_meta and video_meta.get('content'):
             add_candidate(video_meta['content'], base_score=-5, source='meta')
 
-        if not candidates:
-            return []
+        # 2. Gather adaptive M3U8 (HLS) stream manifests
+        m3u8_urls = set()
 
-        unique = {}
-        for c in candidates:
-            u = c['url']
-            if u not in unique or c['score'] > unique[u]['score']:
-                unique[u] = c
+        if api_data.get('hlsMasterPlaylistUrl'):
+            m3u8_urls.add(api_data['hlsMasterPlaylistUrl'])
+        elif json_ld.get('contentUrl'):
+            m3u8_urls.add(json_ld['contentUrl'])
 
-        all_cands = list(unique.values())
+        # Fallback regular expression scanner for raw .m3u8 assignments inside the DOM strings
+        m3u8_patterns = [
+            rf'https?:{_SEP}{_SEP}video\.pmvhaven\.com{_SEP}[^"\'<>\s]+?\.m3u8',
+            rf'https?:{_SEP}{_SEP}storage\.pmvhaven\.com{_SEP}[^"\'<>\s]+?\.m3u8',
+        ]
+        for pattern in m3u8_patterns:
+            for u in re.findall(pattern, webpage):
+                u = u.replace('\\u002F', '/')
+                m3u8_urls.add(u)
 
-        non_preview = [c for c in all_cands if not c['is_preview']]
-        chosen_pool = non_preview or all_cands
+        formats = []
 
-        best = max(chosen_pool, key=lambda c: (c['score'], len(c['url'])))
+        # Determine if we have any valid video formats (non-preview)
+        has_real_video = any(not c['is_preview'] for c in candidates) or bool(m3u8_urls)
 
-        fmt = {
-            'url': best['url'],
-            'ext': 'mp4',
-            'http_headers': {'Referer': url},
-        }
-        if resolution:
-            fmt['resolution'] = resolution
+        # Build progressive format objects
+        if candidates:
+            unique = {}
+            for c in candidates:
+                u = c['url']
+                if u not in unique or c['score'] > unique[u]['score']:
+                    unique[u] = c
 
-        m_h = re.search(r'(\d{3,4})p', best['url'])
-        if m_h:
-            h = int_or_none(m_h.group(1))
-            if h:
-                fmt['height'] = h
+            for idx, c in enumerate(unique.values()):
+                # Omit previews entirely if we have legitimate full formats
+                if has_real_video and c['is_preview']:
+                    continue
 
-        return [fmt]
+                parsed_cand = urllib.parse.urlsplit(c['url'])
+                subdomain = parsed_cand.netloc.split('.')[0] if parsed_cand.netloc else 'video'
+                preview_suffix = '-preview' if c['is_preview'] else ''
+                format_id = f'{subdomain}{preview_suffix}-{idx}'
 
-    def _extract_video_meta(self, soup):
+                fmt = {
+                    'url': c['url'],
+                    'ext': 'mp4',
+                    'format_id': format_id,
+                    'http_headers': {'Referer': url},
+                    'preference': c['score'],
+                }
+
+                if not c['is_preview']:
+                    # API file size
+                    if api_data.get('fileSize'):
+                        fmt['filesize'] = api_data['fileSize']
+
+                    if resolution:
+                        fmt['resolution'] = resolution
+                    if height:
+                        fmt['height'] = height
+
+                    m_h = re.search(r'(\d{3,4})p', c['url'])
+                    if m_h:
+                        h = int(m_h.group(1))
+                        if h:
+                            fmt['height'] = h
+                            if h != height:
+                                fmt.pop('resolution', None)
+                else:
+                    # Explicitly remove dimensions so previews aren't assigned the main video's size
+                    fmt['format_note'] = 'Preview'
+                    fmt.pop('resolution', None)
+                    fmt.pop('height', None)
+                    fmt.pop('width', None)
+
+                formats.append(fmt)
+
+        # Extract adaptive sub-formats via HLS stream extraction loops
+        for m3u8_url in m3u8_urls:
+            hls_formats = self._extract_m3u8_formats(
+                m3u8_url, page_vid or 'video', ext='mp4',
+                entry_protocol='m3u8_native', m3u8_id='hls', fatal=False
+            )
+            for f in hls_formats:
+                f.setdefault('http_headers', {})['Referer'] = url
+            formats.extend(hls_formats)
+
+        return formats
+
+    def _extract_video_meta(self, soup, api_data):
         meta = {}
-        width_meta = soup.find('meta', attrs={'property': 'og:video:width'})
-        height_meta = soup.find('meta', attrs={'property': 'og:video:height'})
-        if not width_meta:
-            width_meta = soup.find('meta', attrs={'name': 'twitter:player:width'})
-        if not height_meta:
-            height_meta = soup.find('meta', attrs={'name': 'twitter:player:height'})
 
-        if width_meta and height_meta:
-            meta['width'] = int(width_meta['content'])
-            meta['height'] = int(height_meta['content'])
-        
-        if 'width' in meta and 'height' in meta:
-            meta['resolution'] = f"{meta['width']}x{meta['height']}"
-        
+        width = self._extract_width(soup, api_data)
+        height = self._extract_height(soup, api_data)
+
+        if width and height:
+            meta['width'] = width
+            meta['height'] = height
+            meta['resolution'] = f"{width}x{height}"
+
         return meta
 
-    def _extract_width(self, soup):
+    def _extract_width(self, soup, api_data):
+        if api_data.get('width'):
+            return int(api_data['width'])
+
         width_meta = soup.find('meta', attrs={'property': 'og:video:width'})
         if not width_meta:
             width_meta = soup.find('meta', attrs={'name': 'twitter:player:width'})
@@ -296,7 +522,10 @@ class PMVHavenVideoIE(InfoExtractor):
             return int(width_meta['content'])
         return None
 
-    def _extract_height(self, soup):
+    def _extract_height(self, soup, api_data):
+        if api_data.get('height'):
+            return int(api_data['height'])
+
         height_meta = soup.find('meta', attrs={'property': 'og:video:height'})
         if not height_meta:
             height_meta = soup.find('meta', attrs={'name': 'twitter:player:height'})
