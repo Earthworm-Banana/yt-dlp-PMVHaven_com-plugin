@@ -87,13 +87,21 @@ class PMVHavenVideoIE(InfoExtractor):
         return []
 
     def _extract_creator(self, soup):
-        desc_meta = soup.find('meta', attrs={'name': 'description'})
-        if desc_meta:
-            description = desc_meta['content']
-            creator = description.split()[-1]
-            return creator
-        return None
+        img = soup.find('img', alt=True, src=re.compile(r'/profiles/'))
+        if img:
+            return img['alt'].strip()
 
+        for img in soup.find_all('img', alt=True):
+            alt = img['alt'].strip()
+            if not alt:
+                continue
+            if alt.lower() == 'logo':
+                continue
+            if alt.startswith('Thumbnail at '):
+                continue
+            return alt
+
+        return None
 
     def _extract_stars(self, soup):
         # Implement your method to extract stars here
@@ -132,23 +140,135 @@ class PMVHavenVideoIE(InfoExtractor):
         return None
 
     def _extract_formats(self, soup, url):
+
+        # collect .mp4 URLs (video.pmvhaven.com and storage.pmvhaven.com)
+        # score candidates 1. video.pmvhaven.com, 2. if first path segment looks like this page's video id, 3. bonus if slug/title words appear in the URL, 4. penalize /videoPreview/ or /previews/
+        # pick highest-scoring
+        
+        import urllib.parse
+
+        webpage = str(soup)
+
+        title = self._extract_title(soup) or ''
+        title_norm = re.sub(r'\s+', ' ', title).strip().lower()
+
+        page_vid = self._search_regex(
+            r'_([0-9a-fA-F]{24})', url, 'video id', default=None)
+
+        slug = None
+        m_slug = re.search(r'/video/([^_?]+)_[0-9a-fA-F]{24}', url)
+        if m_slug:
+            slug = urllib.parse.unquote(m_slug.group(1))
+        slug_words = [w.lower() for w in re.split(r'[-_\s]+', slug or '') if len(w) > 2]
+
+        width = self._extract_width(soup)
+        height = self._extract_height(soup)
+        resolution = f'{width}x{height}' if width and height else None
+
+        def is_preview(u: str) -> bool:
+            u = u.lower()
+            return '/videopreview/' in u or '/previews/' in u
+
+        def normalize_url(vurl: str) -> str:
+            if not vurl:
+                return vurl
+            vurl = vurl.strip()
+            if not vurl.startswith('http'):
+                vurl = 'https://' + vurl.lstrip('/')
+            parsed = urllib.parse.urlsplit(vurl)
+            path = urllib.parse.quote(parsed.path, safe='/%')
+            return urllib.parse.urlunsplit(
+                (parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment)
+            )
+
+        candidates = []
+
+        def add_candidate(vurl: str, base_score: int = 0, source: str = ''):
+            vurl = normalize_url(vurl)
+            if not vurl:
+                return
+
+            parsed = urllib.parse.urlsplit(vurl)
+            path_parts = parsed.path.strip('/').split('/')
+            first_seg = path_parts[0] if path_parts else ''
+            id_in_url = first_seg if re.match(r'^[0-9a-fA-F]{24}$', first_seg) else None
+
+            url_l = vurl.lower()
+            score = base_score
+
+            if is_preview(url_l):
+                score -= 20
+
+            if parsed.netloc.startswith('video.pmvhaven.com'):
+                score += 10
+            elif parsed.netloc.startswith('storage.pmvhaven.com'):
+                score += 0
+
+            if page_vid and id_in_url and id_in_url.lower() == page_vid.lower():
+                score += 10
+
+            for w in slug_words:
+                if w and w in url_l:
+                    score += 2
+
+            for w in re.split(r'\s+', title_norm):
+                if len(w) > 3 and w in url_l:
+                    score += 1
+
+            candidates.append({
+                'url': vurl,
+                'score': score,
+                'is_preview': is_preview(url_l),
+                'source': source,
+            })
+
+        _SEP = r'(?:/|\\u002F)'
+        mp4_patterns = [
+            rf'https?:{_SEP}{_SEP}video\.pmvhaven\.com{_SEP}[^"\'<>\s]+?\.mp4',
+            rf'https?:{_SEP}{_SEP}storage\.pmvhaven\.com{_SEP}[^"\'<>\s]+?\.mp4',
+        ]
+        for pattern in mp4_patterns:
+            for u in re.findall(pattern, webpage):
+                u = u.replace('\\u002F', '/')  # decode JSON unicode escapes
+                add_candidate(u, base_score=0, source='scan')
+
         video_meta = soup.find('meta', attrs={'property': 'og:video:secure_url'})
         if not video_meta:
             video_meta = soup.find('meta', attrs={'name': 'twitter:player'})
-        video_url = video_meta['content'] if video_meta else None
-        width = self._extract_width(soup)
-        height = self._extract_height(soup)
-        resolution = f'{width}x{height}' if width and height else 'unknown'
-        if video_url:
-            return [{
-                'url': video_url, 
-                'ext': 'mp4', 
-                'http_headers': {'Referer': f'{url}'},
-                #'vcodec': '',
-                #'acodec': '',
-                'resolution': resolution
-            }]
-        return []
+        if video_meta and video_meta.get('content'):
+            add_candidate(video_meta['content'], base_score=-5, source='meta')
+
+        if not candidates:
+            return []
+
+        unique = {}
+        for c in candidates:
+            u = c['url']
+            if u not in unique or c['score'] > unique[u]['score']:
+                unique[u] = c
+
+        all_cands = list(unique.values())
+
+        non_preview = [c for c in all_cands if not c['is_preview']]
+        chosen_pool = non_preview or all_cands
+
+        best = max(chosen_pool, key=lambda c: (c['score'], len(c['url'])))
+
+        fmt = {
+            'url': best['url'],
+            'ext': 'mp4',
+            'http_headers': {'Referer': url},
+        }
+        if resolution:
+            fmt['resolution'] = resolution
+
+        m_h = re.search(r'(\d{3,4})p', best['url'])
+        if m_h:
+            h = int_or_none(m_h.group(1))
+            if h:
+                fmt['height'] = h
+
+        return [fmt]
 
     def _extract_video_meta(self, soup):
         meta = {}
@@ -188,89 +308,149 @@ class PMVHavenUserIE(InfoExtractor):
     IE_NAME = 'pmvhaven:user'
     _VALID_URL = r'https?://(?:www\.)?pmvhaven\.com/profile/(?P<id>[\w.-]+)'
 
-    _API = 'https://pmvhaven.com/api/v2/profileInput'
-    _PAGE_SIZE = 20  # API currently returns 20 items per page
+    _VIDEOS_API = 'https://pmvhaven.com/api/videos'
+    _PAGE_SIZE = 100  
 
     _TESTS = [{
         'url': 'https://pmvhaven.com/profile/wezzam',
-        'info_dict': {'id': 'wezzam', 'title': 'wezzam'},
-        'playlist_mincount': 20,
+
+        'info_dict': {'id': 'wezzam', 'title': "wezzam"},
+        'playlist_mincount': 1,
     }]
 
-    def _call_api(self, user, page):
-        """
-        Page 0 (first page) is fetched without 'index'.
-        Page 1 -> index: 2, Page 2 -> index: 3, etc.
-        """
-        payload = {'mode': 'getProfileVideos', 'user': user}
-        if page > 0:
-            payload['index'] = page + 1  # 1->2, 2->3...
+    def _extract_user_id_from_html(self, webpage, fallback_slug):
 
-        headers = {
-            'Content-Type': 'text/plain;charset=UTF-8',
-            'Origin': 'https://pmvhaven.com',
-            'Referer': f'https://pmvhaven.com/profile/{user}',
+        m = re.search(r'/banners/([0-9a-fA-F]{24})-', webpage)
+        if m:
+            return m.group(1)
+        return fallback_slug
+
+    def _extract_profile_title(self, soup, fallback_slug):
+        og = soup.find('meta', attrs={'property': 'og:title'})
+        if og and og.get('content'):
+            title = og['content']
+
+            m = re.match(r"(.+?)'s Profile$", title)
+            if m:
+                return m.group(1)
+            return title
+
+        if soup.title and soup.title.string:
+            return soup.title.string.strip()
+        return fallback_slug
+
+    def _fetch_videos_page(self, uploader_id, page):
+        query = {
+            'uploader': uploader_id,
+            'limit': self._PAGE_SIZE,
+            'page': page,
         }
-        return self._download_json(
-            self._API, user,
-            note=f'Downloading profile JSON page {page + 1}',
-            headers=headers,
-            data=json.dumps(payload).encode('utf-8'))
+        resp = self._download_json(
+            self._VIDEOS_API,
+            uploader_id,
+            note=f'Downloading PMVHaven profile videos JSON page {page}',
+            query=query)
 
-    @staticmethod
-    def _slugify(title):
-        """
-        PMVHaven-safe slug to match PMVHavenVideoIE URL regex:
-        keep [A-Za-z0-9 ] -> hyphens; strip others.
-        """
-        if not title:
-            return 'video'
-        cleaned = re.sub(r'[^A-Za-z0-9 ]+', '', title)
-        slug = re.sub(r'\s+', '-', cleaned).strip('-')
-        return slug or 'video'
+        videos = traverse_obj(resp, ('videos', {list})) or []
+        total_pages = int_or_none(traverse_obj(resp, ('pagination', 'totalPages')))
+        return videos, (total_pages or page)
 
-    def _entries_page(self, user, page):
-        data = self._call_api(user, page)
+    def _build_video_result(self, video_obj, uploader_name):
+        vid = traverse_obj(video_obj, ('_id', {str}))
+        if not vid:
+            return None
 
-        # Stop paging once we've covered total count
-        total = int_or_none(data.get('count'))
-        if total is not None and page * self._PAGE_SIZE >= total:
-            return
+        title = traverse_obj(video_obj, ('title', {str})) or vid
 
-        videos = traverse_obj(data, ('videos', {list})) or []
-        for v in videos:
-            vid = traverse_obj(v, ('_id', {str}))
-            title = traverse_obj(v, ('title', {str})) or vid
-            slug = self._slugify(title)
-            webpage_url = f'https://pmvhaven.com/video/{slug}_{vid}'
+        webpage_url = f'https://pmvhaven.com/video/video_{vid}'
 
-            ie_result = self.url_result(
-                webpage_url,
+        ie_result = self.url_result(
+            webpage_url,
+            ie=PMVHavenVideoIE.ie_key(),
+            video_id=vid,
+            video_title=title,
+        )
+
+        iso = traverse_obj(video_obj, ('isoDate', {str})) or traverse_obj(video_obj, ('createdAt', {str}))
+        thumb_list = traverse_obj(video_obj, ('thumbnails', {list})) or []
+        if not thumb_list:
+            single_thumb = traverse_obj(video_obj, ('thumbnailUrl', {str}))
+            if single_thumb:
+                thumb_list = [single_thumb]
+        thumbs = [{'url': t} for t in thumb_list if isinstance(t, str)]
+        views = int_or_none(traverse_obj(video_obj, ('views', {int, str})))
+
+        ie_result.update({
+            'thumbnails': thumbs or None,
+            'timestamp': parse_iso8601(iso),
+            'uploader': uploader_name,
+            'view_count': views,
+        })
+        return ie_result
+
+    def _entries_from_api(self, uploader_id, uploader_name):
+        page = 1
+        total_pages = None
+        while True:
+            videos, reported_total = self._fetch_videos_page(uploader_id, page)
+            if not videos:
+                break
+
+            if total_pages is None:
+                total_pages = reported_total
+
+            for v in videos:
+                res = self._build_video_result(v, uploader_name)
+                if res:
+                    yield res
+
+            page += 1
+            if total_pages is not None and page > total_pages:
+                break
+
+    def _entries_from_html(self, webpage, user_slug, uploader_name):
+        soup = BeautifulSoup(webpage, 'html.parser')
+        seen = set()
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if '/video/' not in href:
+                continue
+            if href.startswith('/'):
+                href = 'https://pmvhaven.com' + href
+            vid = self._search_regex(
+                r'_([a-fA-F0-9]{24})',
+                href,
+                'video id',
+                default=None)
+            if not vid or vid in seen:
+                continue
+            seen.add(vid)
+            title = (a.get('title')
+                     or a.get('aria-label')
+                     or a.get_text(strip=True)
+                     or vid)
+            yield self.url_result(
+                href,
                 ie=PMVHavenVideoIE.ie_key(),
                 video_id=vid,
                 video_title=title,
             )
 
-            iso = traverse_obj(v, ('isoDate', {str}))
-            thumb_list = traverse_obj(v, ('thumbnails', {list})) or []
-            thumbs = [{'url': t} for t in thumb_list if isinstance(t, str)]
-            views = int_or_none(traverse_obj(v, ('views', {int, str})))
-            uploader = traverse_obj(v, ('uploader', {str})) or traverse_obj(v, ('creator', {str}))
-
-            ie_result.update({
-                'thumbnails': thumbs or None,
-                'timestamp': parse_iso8601(iso),
-                'uploader': uploader,
-                'view_count': views,
-            })
-            yield ie_result
-
     def _real_extract(self, url):
-        user = self._match_id(url)
+        user_slug = self._match_id(url)
 
-        def page_func(page):
-            return list(self._entries_page(user, page))
+        webpage = self._download_webpage(url, user_slug)
+        soup = BeautifulSoup(webpage, 'html.parser')
 
-        return self.playlist_result(
-            OnDemandPagedList(page_func, self._PAGE_SIZE),
-            playlist_id=user, playlist_title=user)
+        uploader_id = self._extract_user_id_from_html(webpage, user_slug)
+        uploader_name = self._extract_profile_title(soup, user_slug)
+
+        entries = list(self._entries_from_api(uploader_id, uploader_name))
+
+        if not entries:
+            entries = list(self._entries_from_html(webpage, user_slug, uploader_name))
+
+        playlist_id = uploader_id
+        playlist_title = uploader_name
+
+        return self.playlist_result(entries, playlist_id=playlist_id, playlist_title=playlist_title)
